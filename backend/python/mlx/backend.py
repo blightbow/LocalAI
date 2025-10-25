@@ -5,7 +5,7 @@ import argparse
 import signal
 import sys
 import os
-from typing import List
+from typing import List, Optional
 import time
 
 import backend_pb2
@@ -14,7 +14,7 @@ import backend_pb2_grpc
 import grpc
 from mlx_lm import load, generate, stream_generate
 from mlx_lm.sample_utils import make_sampler
-from mlx_lm.models.cache import make_prompt_cache
+from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
 import mlx.core as mx
 import base64
 import io
@@ -43,7 +43,218 @@ def is_int(s):
 class BackendServicer(backend_pb2_grpc.BackendServicer):
     """
     A gRPC servicer that implements the Backend service defined in backend.proto.
+
+    This servicer manages model state, tokenizer, and a global KV cache for efficient
+    inference. The cache is shared across requests and uses prefix-based trimming to
+    maintain correctness when prompts change.
     """
+
+    def __init__(self):
+        """Initialize the servicer with cache management state."""
+        super().__init__()
+        # Cache synchronization
+        self._cache_lock = asyncio.Lock()
+
+        # Track last prompt for prefix-based trimming
+        self._last_prompt_tokens: Optional[List[int]] = None
+        self._last_prompt_length: int = 0  # Track prompt length separately from cache size
+        self._last_prompt_string: Optional[str] = None  # Cache prompt string for fast comparison
+
+        # Detect append-only patterns for optimization
+        self._consecutive_appends = 0
+
+        # Cache performance metrics
+        self._cache_hits = 0
+        self._cache_trims = 0
+        self._total_requests = 0
+        self._tokenization_cache_hits = 0  # Track tokenization cache efficiency
+
+    def _tokenize_with_cache(self, prompt_string: str) -> List[int]:
+        """
+        Tokenize a prompt with intelligent caching to avoid redundant tokenization.
+
+        Optimization strategy:
+        1. Identical prompt (retry/swipe): Reuse cached tokens (0 tokenization)
+        2. Append-only prompt (chat): Tokenize only new part (partial tokenization)
+        3. Different prompt: Full tokenization (unavoidable)
+
+        Args:
+            prompt_string: The prompt text to tokenize.
+
+        Returns:
+            List[int]: Token IDs.
+        """
+        # Optimization 1: Check for identical prompt (retry/swipe case)
+        if prompt_string == self._last_prompt_string and self._last_prompt_tokens is not None:
+            self._tokenization_cache_hits += 1
+            print(
+                f"cache: HIT - Reusing cached tokens ({len(self._last_prompt_tokens)} tokens)",
+                file=sys.stderr
+            )
+            return self._last_prompt_tokens
+
+        # Optimization 2: Check for append-only pattern (chat case)
+        if (self._last_prompt_string is not None
+            and self._last_prompt_tokens is not None
+            and prompt_string.startswith(self._last_prompt_string)
+            and len(prompt_string) > len(self._last_prompt_string)):
+
+            # Tokenize only the NEW part
+            new_part = prompt_string[len(self._last_prompt_string):]
+            new_tokens = self.tokenizer.encode(new_part, add_special_tokens=False)
+
+            # Combine with cached tokens
+            full_tokens = self._last_prompt_tokens + new_tokens
+
+            self._tokenization_cache_hits += 1
+            print(
+                f"cache: PARTIAL HIT - Tokenized {len(new_tokens)} new tokens "
+                f"(reused {len(self._last_prompt_tokens)} cached tokens)",
+                file=sys.stderr
+            )
+            return full_tokens
+
+        # Optimization 3: Full tokenization (different prompt)
+        tokens = self.tokenizer.encode(prompt_string, add_special_tokens=True)
+        print(
+            f"cache: MISS - Full tokenization ({len(tokens)} tokens)",
+            file=sys.stderr
+        )
+        return tokens
+
+    def _trim_cache_to_prefix(self, new_tokens: List[int]) -> int:
+        """
+        Trim the prompt cache to the longest common prefix with the new prompt.
+
+        This implements prefix-based cache management.
+
+        CRITICAL: The cache contains BOTH prompt tokens AND generated tokens.
+        We must:
+        1. First trim any previous generation (backtrack to prompt only)
+        2. Then compare prompts and trim to common prefix
+        3. Track the new prompt length for next request
+
+        Args:
+            new_tokens: Token IDs of the new prompt.
+
+        Returns:
+            int: Total number of tokens trimmed from the cache.
+        """
+        total_trimmed = 0
+
+        # Step 1: Trim any previous generation tokens
+        # The cache contains: [old_prompt_tokens | old_generation_tokens]
+        # We need to backtrack to: [old_prompt_tokens] before comparing with new prompt
+        if self._last_prompt_length > 0 and hasattr(self, 'prompt_cache') and self.prompt_cache:
+            # Get current cache size (includes prompt + generation from previous request)
+            cache_size = self.prompt_cache[0].offset if self.prompt_cache else 0
+            generation_length = cache_size - self._last_prompt_length
+
+            if generation_length > 0:
+                # Trim the previous generation
+                actual = trim_prompt_cache(self.prompt_cache, generation_length)
+                total_trimmed += actual
+                print(
+                    f"cache: Backtracked {actual} tokens "
+                    f"(removing previous generation, cache: {cache_size} → {cache_size - actual})",
+                    file=sys.stderr
+                )
+
+        # Step 2: Handle first request
+        if self._last_prompt_tokens is None:
+            self._last_prompt_tokens = new_tokens
+            self._last_prompt_length = len(new_tokens)
+            self._consecutive_appends = 0
+            print(
+                f"cache: First request - initializing with {len(new_tokens)} tokens",
+                file=sys.stderr
+            )
+            return total_trimmed
+
+        # Step 3: Compare new prompt with old prompt
+        old_tokens = self._last_prompt_tokens
+        old_len = len(old_tokens)
+        new_len = len(new_tokens)
+
+        # Check for append-only pattern (optimization)
+        if new_len > old_len and new_tokens[:old_len] == old_tokens:
+            # Append-only: new prompt extends the old one
+            # Example: "hello" -> "hello world"
+            self._consecutive_appends += 1
+            self._cache_hits += 1
+            appended_tokens = new_len - old_len
+            print(
+                f"cache: Append-only pattern detected "
+                f"(consecutive: {self._consecutive_appends}). "
+                f"Cache fully reused, appending {appended_tokens} new tokens.",
+                file=sys.stderr
+            )
+            self._last_prompt_tokens = new_tokens
+            self._last_prompt_length = new_len
+            return total_trimmed
+
+        # Find longest common prefix
+        common_len = 0
+        min_len = min(old_len, new_len)
+        for i in range(min_len):
+            if old_tokens[i] == new_tokens[i]:
+                common_len += 1
+            else:
+                break
+
+        # Calculate tokens to trim from the prompt portion
+        tokens_to_trim = old_len - common_len
+
+        if tokens_to_trim > 0:
+            # Reset append-only counter since we're diverging
+            self._consecutive_appends = 0
+            self._cache_trims += 1
+
+            # Trim the cache to the common prefix
+            actual_trimmed = trim_prompt_cache(self.prompt_cache, tokens_to_trim)
+            total_trimmed += actual_trimmed
+
+            print(
+                f"cache: Trimmed {actual_trimmed} tokens "
+                f"(common prefix: {common_len}/{old_len} tokens, diverged at token {common_len})",
+                file=sys.stderr
+            )
+        elif old_len == new_len:
+            # Prompts are identical
+            self._cache_hits += 1
+            print(
+                f"cache: Identical prompt detected ({new_len} tokens), cache fully reused",
+                file=sys.stderr
+            )
+        else:
+            # New prompt is a prefix of old (rare edge case)
+            # Example: "hello world" -> "hello"
+            self._cache_trims += 1
+            tokens_to_trim = old_len - new_len
+            actual_trimmed = trim_prompt_cache(self.prompt_cache, tokens_to_trim)
+            total_trimmed += actual_trimmed
+            print(
+                f"cache: New prompt is prefix of old, trimmed {actual_trimmed} tokens",
+                file=sys.stderr
+            )
+
+        self._last_prompt_tokens = new_tokens
+        self._last_prompt_length = new_len
+        return total_trimmed
+
+    def _log_cache_stats(self):
+        """Log cache performance statistics."""
+        if self._total_requests > 0:
+            hit_rate = (self._cache_hits / self._total_requests) * 100
+            tok_cache_rate = (self._tokenization_cache_hits / self._total_requests) * 100
+            print(
+                f"cache stats - Requests: {self._total_requests}, "
+                f"KV cache hits: {self._cache_hits} ({hit_rate:.1f}%), "
+                f"Tokenization cache hits: {self._tokenization_cache_hits} ({tok_cache_rate:.1f}%), "
+                f"Trims: {self._cache_trims}, "
+                f"Consecutive appends: {self._consecutive_appends}",
+                file=sys.stderr
+            )
 
     def Health(self, request, context):
         """
@@ -122,7 +333,19 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             # Initialize prompt cache for efficient generation
             max_kv_size = self.options.get("max_kv_size", None)
             self.prompt_cache = make_prompt_cache(self.model, max_kv_size)
-                
+
+            # Reset cache tracking state when new model is loaded
+            self._last_prompt_tokens = None
+            self._last_prompt_length = 0
+            self._last_prompt_string = None
+            self._consecutive_appends = 0
+            self._cache_hits = 0
+            self._cache_trims = 0
+            self._total_requests = 0
+            self._tokenization_cache_hits = 0
+
+            print("cache: Initialized new prompt cache", file=sys.stderr)
+
         except Exception as err:
             print(f"Error loading MLX model {err=}, {type(err)=}", file=sys.stderr)
             return backend_pb2.Result(success=False, message=f"Error loading MLX model: {err}")
@@ -134,6 +357,10 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
         """
         Generates text based on the given prompt and sampling parameters using MLX.
 
+        This method uses a cache lock to ensure thread-safe access to the model,
+        tokenizer, and prompt cache. The cache is trimmed to match the common
+        prefix with the previous prompt before generation.
+
         Args:
             request: The predict request.
             context: The gRPC context.
@@ -142,30 +369,58 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             backend_pb2.Reply: The predict result.
         """
         try:
-            # Prepare the prompt
-            prompt = self._prepare_prompt(request)
-            
-            # Build generation parameters using request attributes and options
-            max_tokens, sampler_params = self._build_generation_params(request)
-            
-            print(f"Generating text with MLX - max_tokens: {max_tokens}, sampler_params: {sampler_params}", file=sys.stderr)
-            
-            # Create sampler with parameters
-            sampler = make_sampler(**sampler_params)
-            
-            # Generate text using MLX with proper parameters
-            response = generate(
-                self.model,
-                self.tokenizer,
-                prompt=prompt,
-                max_tokens=max_tokens,
-                sampler=sampler,
-                prompt_cache=self.prompt_cache,
-                verbose=False
-            )
-            
-            return backend_pb2.Reply(message=bytes(response, encoding='utf-8'))
-            
+            # Acquire cache lock for thread-safe operation
+            async with self._cache_lock:
+                self._total_requests += 1
+
+                # Prepare the prompt (apply chat template, etc.)
+                prompt = self._prepare_prompt(request)
+
+                # OPTIMIZATION: Use cached tokenization when possible
+                # - Retry/swipe: Reuses tokens from identical prompt (0 tokenization)
+                # - Append-only: Tokenizes only new part (partial tokenization)
+                # - Different prompt: Full tokenization (unavoidable)
+                prompt_tokens = self._tokenize_with_cache(prompt)
+
+                # Trim cache to common prefix (with append-only optimization)
+                self._trim_cache_to_prefix(prompt_tokens)
+
+                # Update cached prompt string for next request
+                self._last_prompt_string = prompt
+
+                # Build generation parameters using request attributes and options
+                max_tokens, sampler_params = self._build_generation_params(request)
+
+                print(
+                    f"Generating text with MLX - "
+                    f"prompt_tokens: {len(prompt_tokens)}, "
+                    f"max_tokens: {max_tokens}, "
+                    f"sampler_params: {sampler_params}",
+                    file=sys.stderr
+                )
+
+                # Create sampler with parameters
+                sampler = make_sampler(**sampler_params)
+
+                # OPTIMIZATION: Pass tokens directly to generate() to avoid re-tokenization
+                # MLX generate() accepts: str | mx.array | List[int]
+                # By passing List[int], we skip redundant tokenization inside generate()
+                response = generate(
+                    self.model,
+                    self.tokenizer,
+                    prompt=prompt_tokens,  # <-- Pass tokens directly!
+                    max_tokens=max_tokens,
+                    sampler=sampler,
+                    prompt_cache=self.prompt_cache,
+                    verbose=False
+                )
+
+                # Log cache statistics periodically
+                if self._total_requests % 10 == 0:
+                    self._log_cache_stats()
+
+                return backend_pb2.Reply(message=bytes(response, encoding='utf-8'))
+
         except Exception as e:
             print(f"Error in MLX Predict: {e}", file=sys.stderr)
             context.set_code(grpc.StatusCode.INTERNAL)
@@ -194,6 +449,10 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
         """
         Generates text based on the given prompt and sampling parameters, and streams the results using MLX.
 
+        This method uses a cache lock to ensure thread-safe access to the model,
+        tokenizer, and prompt cache. The cache is trimmed to match the common
+        prefix with the previous prompt before generation.
+
         Args:
             request: The predict stream request.
             context: The gRPC context.
@@ -202,28 +461,54 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             backend_pb2.Reply: Streaming predict results.
         """
         try:
-            # Prepare the prompt
-            prompt = self._prepare_prompt(request)
-            
-            # Build generation parameters using request attributes and options
-            max_tokens, sampler_params = self._build_generation_params(request, default_max_tokens=512)
-            
-            print(f"Streaming text with MLX - max_tokens: {max_tokens}, sampler_params: {sampler_params}", file=sys.stderr)
-            
-            # Create sampler with parameters
-            sampler = make_sampler(**sampler_params)
-            
-            # Stream text generation using MLX with proper parameters
-            for response in stream_generate(
-                self.model,
-                self.tokenizer,
-                prompt=prompt,
-                max_tokens=max_tokens,
-                sampler=sampler,
-                prompt_cache=self.prompt_cache,
-            ):
-                yield backend_pb2.Reply(message=bytes(response.text, encoding='utf-8'))
-                
+            # Acquire cache lock for thread-safe operation
+            # Note: We hold the lock for the entire streaming duration to prevent
+            # cache corruption from concurrent requests
+            async with self._cache_lock:
+                self._total_requests += 1
+
+                # Prepare the prompt (apply chat template, etc.)
+                prompt = self._prepare_prompt(request)
+
+                # OPTIMIZATION: Use cached tokenization when possible
+                prompt_tokens = self._tokenize_with_cache(prompt)
+
+                # Trim cache to common prefix (with append-only optimization)
+                self._trim_cache_to_prefix(prompt_tokens)
+
+                # Update cached prompt string for next request
+                self._last_prompt_string = prompt
+
+                # Build generation parameters using request attributes and options
+                max_tokens, sampler_params = self._build_generation_params(request, default_max_tokens=512)
+
+                print(
+                    f"Streaming text with MLX - "
+                    f"prompt_tokens: {len(prompt_tokens)}, "
+                    f"max_tokens: {max_tokens}, "
+                    f"sampler_params: {sampler_params}",
+                    file=sys.stderr
+                )
+
+                # Create sampler with parameters
+                sampler = make_sampler(**sampler_params)
+
+                # OPTIMIZATION: Pass tokens directly to stream_generate()
+                # Stream text generation using MLX with trimmed cache
+                for response in stream_generate(
+                    self.model,
+                    self.tokenizer,
+                    prompt=prompt_tokens,  # <-- Pass tokens directly!
+                    max_tokens=max_tokens,
+                    sampler=sampler,
+                    prompt_cache=self.prompt_cache,
+                ):
+                    yield backend_pb2.Reply(message=bytes(response.text, encoding='utf-8'))
+
+                # Log cache statistics periodically
+                if self._total_requests % 10 == 0:
+                    self._log_cache_stats()
+
         except Exception as e:
             print(f"Error in MLX PredictStream: {e}", file=sys.stderr)
             context.set_code(grpc.StatusCode.INTERNAL)
