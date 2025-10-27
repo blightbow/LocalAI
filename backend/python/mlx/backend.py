@@ -382,6 +382,14 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 # - Different prompt: Full tokenization (unavoidable)
                 prompt_tokens = self._tokenize_with_cache(prompt)
 
+                # Check if we can use cache resume optimization
+                # This is safe when prompt is identical to the last one
+                can_resume = (
+                    prompt == self._last_prompt_string
+                    and self._last_prompt_tokens is not None
+                    and len(prompt_tokens) == len(self._last_prompt_tokens)
+                )
+
                 # Trim cache to common prefix (with append-only optimization)
                 self._trim_cache_to_prefix(prompt_tokens)
 
@@ -395,7 +403,8 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                     f"Generating text with MLX - "
                     f"prompt_tokens: {len(prompt_tokens)}, "
                     f"max_tokens: {max_tokens}, "
-                    f"sampler_params: {sampler_params}",
+                    f"sampler_params: {sampler_params}, "
+                    f"resume_from_cache: {can_resume}",
                     file=sys.stderr
                 )
 
@@ -405,6 +414,7 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 # OPTIMIZATION: Pass tokens directly to generate() to avoid re-tokenization
                 # MLX generate() accepts: str | mx.array | List[int]
                 # By passing List[int], we skip redundant tokenization inside generate()
+                # NEW OPTIMIZATION: resume_from_cache skips prefill when cache already valid
                 response = generate(
                     self.model,
                     self.tokenizer,
@@ -412,6 +422,7 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                     max_tokens=max_tokens,
                     sampler=sampler,
                     prompt_cache=self.prompt_cache,
+                    resume_from_cache=can_resume,  # <-- NEW: Skip prefill on identical prompt
                     verbose=False
                 )
 
@@ -473,6 +484,14 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 # OPTIMIZATION: Use cached tokenization when possible
                 prompt_tokens = self._tokenize_with_cache(prompt)
 
+                # Check if we can use cache resume optimization
+                # This is safe when prompt is identical to the last one
+                can_resume = (
+                    prompt == self._last_prompt_string
+                    and self._last_prompt_tokens is not None
+                    and len(prompt_tokens) == len(self._last_prompt_tokens)
+                )
+
                 # Trim cache to common prefix (with append-only optimization)
                 self._trim_cache_to_prefix(prompt_tokens)
 
@@ -486,7 +505,8 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                     f"Streaming text with MLX - "
                     f"prompt_tokens: {len(prompt_tokens)}, "
                     f"max_tokens: {max_tokens}, "
-                    f"sampler_params: {sampler_params}",
+                    f"sampler_params: {sampler_params}, "
+                    f"resume_from_cache: {can_resume}",
                     file=sys.stderr
                 )
 
@@ -495,6 +515,7 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
 
                 # OPTIMIZATION: Pass tokens directly to stream_generate()
                 # Stream text generation using MLX with trimmed cache
+                # NEW OPTIMIZATION: resume_from_cache skips prefill when cache already valid
                 for response in stream_generate(
                     self.model,
                     self.tokenizer,
@@ -502,6 +523,7 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                     max_tokens=max_tokens,
                     sampler=sampler,
                     prompt_cache=self.prompt_cache,
+                    resume_from_cache=can_resume,  # <-- NEW: Skip prefill on identical prompt
                 ):
                     yield backend_pb2.Reply(message=bytes(response.text, encoding='utf-8'))
 
